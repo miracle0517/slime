@@ -1,6 +1,7 @@
 import logging
 import os
 import random
+import time
 from argparse import Namespace
 from contextlib import nullcontext
 
@@ -23,8 +24,11 @@ from slime.utils.reloadable_process_group import destroy_process_groups, monkey_
 from slime.utils.routing_replay import RoutingReplay
 from slime.utils.timer import Timer, inverse_timer, timer, with_defer
 from slime.utils.transfer_queue import (
+    ACTOR_TRAIN_TASK,
+    CRITIC_TRAIN_TASK,
     clear_partition,
     connect_transfer_queue,
+    default_train_data_fields,
     get_data_from_transfer_queue,
     transfer_queue_enabled,
 )
@@ -266,15 +270,37 @@ class MegatronTrainRayActor(TrainRayActor):
         return rollout_data
 
     def _get_rollout_data_from_transfer_queue(self, rollout_id: int) -> RolloutBatch:
-        task_name = "critic_train" if self.role == "critic" else "actor_train"
+        task_name = CRITIC_TRAIN_TASK if self.role == "critic" else ACTOR_TRAIN_TASK
+        data_fields = default_train_data_fields(self.args)
         rollout_data = None
+        start_time = time.time()
+        next_log_time = start_time + 10
+        poll_interval = max(
+            0.1,
+            min(float(getattr(self.args, "transfer_queue_staleness_poll_interval", 1.0)), 1.0),
+        )
         while rollout_data is None:
             rollout_data, _batch_meta = get_data_from_transfer_queue(
                 self.args,
                 self.transfer_queue_client,
                 rollout_id,
                 task_name=task_name,
+                data_fields=data_fields,
             )
+            if rollout_data is None:
+                now = time.time()
+                if now >= next_log_time and dist.get_rank() == 0:
+                    logger.warning(
+                        "Still waiting for TransferQueue rollout data after %.1fs: rollout_id=%s partition=train_%s "
+                        "task=%s fields=%s",
+                        now - start_time,
+                        rollout_id,
+                        rollout_id,
+                        task_name,
+                        data_fields,
+                    )
+                    next_log_time = now + 10
+                time.sleep(poll_interval)
         return self._postprocess_transfer_queue_rollout_data(rollout_data)
 
     def _postprocess_transfer_queue_rollout_data(self, rollout_data: RolloutBatch) -> RolloutBatch:
