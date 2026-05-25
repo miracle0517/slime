@@ -14,6 +14,15 @@ from slime.utils.async_utils import run
 logger = logging.getLogger(__name__)
 
 TRAIN_PARTITION_PREFIX = "train_"
+ACTOR_TRAIN_TASK = "actor_train"
+CRITIC_TRAIN_TASK = "critic_train"
+
+REQUIRED_TRAIN_DATA_FIELDS = [
+    "tokens",
+    "response_lengths",
+    "loss_masks",
+    "rewards",
+]
 
 
 def transfer_queue_enabled(args: Namespace) -> bool:
@@ -105,17 +114,52 @@ def close_transfer_queue(args: Namespace) -> None:
 
 def _build_sampler(args: Namespace, tq):
     if getattr(args, "balance_data", False):
-        dp_size = args.actor_num_nodes * args.actor_num_gpus_per_node
-        if getattr(args, "context_parallel_size", 1) > 1:
-            dp_size //= args.context_parallel_size
+        dp_size = transfer_queue_data_parallel_size(args)
         logger.info("Using TransferQueue SeqlenBalancedSampler with dp_size=%s", dp_size)
         return tq.SeqlenBalancedSampler(n_samples_per_prompt=args.n_samples_per_prompt, dp_size=dp_size)
     return tq.GRPOGroupNSampler(n_samples_per_prompt=args.n_samples_per_prompt)
 
 
+def transfer_queue_data_parallel_size(args: Namespace) -> int:
+    """Return the Megatron DP size used by TQ before Megatron is initialized."""
+    world_size = args.actor_num_nodes * args.actor_num_gpus_per_node
+    model_parallel_size = (
+        int(getattr(args, "tensor_model_parallel_size", 1))
+        * int(getattr(args, "pipeline_model_parallel_size", 1))
+        * int(getattr(args, "context_parallel_size", 1))
+    )
+    if model_parallel_size <= 0:
+        raise ValueError(f"Invalid model parallel size for TransferQueue: {model_parallel_size}")
+    if world_size % model_parallel_size != 0:
+        raise ValueError(
+            "Actor world size must be divisible by tensor*pipeline*context parallel size when using TransferQueue: "
+            f"world_size={world_size}, model_parallel_size={model_parallel_size}"
+        )
+    return world_size // model_parallel_size
+
+
 def add_total_lengths(train_data: dict[str, Any]) -> dict[str, Any]:
     train_data = dict(train_data)
     train_data["total_lengths"] = [len(tokens) for tokens in train_data["tokens"]]
+    return train_data
+
+
+def normalize_train_data_for_transfer_queue(train_data: dict[str, Any]) -> dict[str, Any]:
+    """Make rollout train_data match the fields actor/critic request from TQ."""
+    missing = [field for field in REQUIRED_TRAIN_DATA_FIELDS if field not in train_data]
+    if missing:
+        raise ValueError(f"TransferQueue rollout data is missing required fields: {missing}")
+
+    train_data = add_total_lengths(train_data)
+    batch_size = len(train_data["tokens"])
+
+    if "raw_reward" not in train_data:
+        train_data["raw_reward"] = list(train_data["rewards"])
+    if "truncated" not in train_data:
+        train_data["truncated"] = [0] * batch_size
+    if "sample_indices" not in train_data:
+        train_data["sample_indices"] = list(range(batch_size))
+
     return train_data
 
 
@@ -180,11 +224,17 @@ def dict_to_tensordict(data: dict[str, list], batch_size: int | torch.Size | Non
 def transfer_rollout_data(args: Namespace, client, rollout_id: int, train_data: dict[str, Any]) -> None:
     """Write one rollout partition to TransferQueue."""
     wait_for_staleness(args, client)
-    train_data = add_total_lengths(train_data)
+    train_data = normalize_train_data_for_transfer_queue(train_data)
     rollout_batch = dict_to_tensordict(train_data, batch_size=len(train_data["tokens"]))
     metadata = run(client.async_put(data=rollout_batch, partition_id=partition_id(rollout_id)))
     _set_total_length_custom_meta(client, metadata, train_data["total_lengths"])
-    logger.info("Transferred rollout_id=%s to TransferQueue with %s samples", rollout_id, len(train_data["tokens"]))
+    logger.info(
+        "Transferred rollout_id=%s to TransferQueue partition=%s with %s samples; fields=%s",
+        rollout_id,
+        partition_id(rollout_id),
+        len(train_data["tokens"]),
+        sorted(train_data.keys()),
+    )
 
 
 def _set_total_length_custom_meta(client, metadata, total_lengths: list[int]) -> None:
@@ -264,11 +314,14 @@ def get_data_from_transfer_queue(
     from megatron.core import mpu
 
     data_fields = data_fields or default_train_data_fields(args)
-    batch_size = (
-        args.rollout_batch_size
-        * args.n_samples_per_prompt
-        // mpu.get_data_parallel_world_size(with_context_parallel=False)
-    )
+    total_batch_size = args.rollout_batch_size * args.n_samples_per_prompt
+    dp_size = mpu.get_data_parallel_world_size(with_context_parallel=False)
+    if total_batch_size % dp_size != 0:
+        raise ValueError(
+            "TransferQueue requires rollout_batch_size*n_samples_per_prompt to be divisible by DP size: "
+            f"total_batch_size={total_batch_size}, dp_size={dp_size}"
+        )
+    batch_size = total_batch_size // dp_size
     sampling_config = {
         "dp_rank": mpu.get_data_parallel_rank(with_context_parallel=False),
         "task_name": task_name,
@@ -292,6 +345,14 @@ def get_data_from_transfer_queue(
         )
         if batch_meta.size != 0:
             payload = [client.get_data(batch_meta), batch_meta]
+            logger.info(
+                "Fetched TransferQueue data: partition=%s task=%s dp_rank=%s batch_size=%s fields=%s",
+                partition_id(rollout_id),
+                task_name,
+                sampling_config["dp_rank"],
+                batch_meta.size,
+                data_fields,
+            )
 
     device = torch.device(f"cuda:{torch.cuda.current_device()}") if torch.cuda.is_available() else torch.device("cpu")
     _broadcast_payload(payload, device)

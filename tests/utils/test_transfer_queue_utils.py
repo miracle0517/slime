@@ -2,7 +2,13 @@ from argparse import Namespace
 
 import pytest
 
-from slime.utils.transfer_queue import add_total_lengths, default_train_data_fields, dict_to_tensordict
+from slime.utils.transfer_queue import (
+    add_total_lengths,
+    default_train_data_fields,
+    dict_to_tensordict,
+    normalize_train_data_for_transfer_queue,
+    transfer_queue_data_parallel_size,
+)
 
 
 def _args(**overrides):
@@ -15,6 +21,11 @@ def _args(**overrides):
         use_opd=False,
         opd_type=None,
         transfer_queue_extra_data_fields=[],
+        actor_num_nodes=2,
+        actor_num_gpus_per_node=8,
+        tensor_model_parallel_size=2,
+        pipeline_model_parallel_size=2,
+        context_parallel_size=2,
     )
     defaults.update(overrides)
     return Namespace(**defaults)
@@ -60,6 +71,28 @@ def test_add_total_lengths_derives_lengths_without_mutating_input():
 
     assert output["total_lengths"] == [3, 2]
     assert "total_lengths" not in data
+
+
+@pytest.mark.unit
+def test_normalize_train_data_for_transfer_queue_fills_requested_base_fields():
+    data = {
+        "tokens": [[1, 2, 3], [4, 5]],
+        "response_lengths": [2, 1],
+        "loss_masks": [[1, 1], [1]],
+        "rewards": [1.0, 0.0],
+    }
+
+    output = normalize_train_data_for_transfer_queue(data)
+
+    assert output["total_lengths"] == [3, 2]
+    assert output["raw_reward"] == [1.0, 0.0]
+    assert output["truncated"] == [0, 0]
+    assert output["sample_indices"] == [0, 1]
+
+
+@pytest.mark.unit
+def test_transfer_queue_data_parallel_size_excludes_model_parallel_ranks():
+    assert transfer_queue_data_parallel_size(_args()) == 2
 
 
 @pytest.mark.unit
