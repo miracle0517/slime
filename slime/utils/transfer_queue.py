@@ -283,13 +283,9 @@ def default_train_data_fields(args: Namespace) -> list[str]:
         "raw_reward",
         "truncated",
         "sample_indices",
+        "rollout_log_probs"
     ]
-    if (
-        getattr(args, "use_rollout_logprobs", False)
-        or getattr(args, "get_mismatch_metrics", False)
-        or getattr(args, "use_tis", False)
-    ):
-        fields.append("rollout_log_probs")
+    
     if getattr(args, "use_rollout_routing_replay", False):
         fields.append("rollout_routed_experts")
     if getattr(args, "multimodal_keys", None) is not None:
