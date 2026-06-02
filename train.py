@@ -4,7 +4,7 @@ from slime.ray.placement_group import create_placement_groups, create_rollout_ma
 from slime.utils.arguments import parse_args
 from slime.utils.logging_utils import configure_logger, finish_tracking, init_tracking, update_tracking_open_metrics
 from slime.utils.misc import should_run_periodic_action
-from slime.utils.transfer_queue import initialize_transfer_queue
+from slime.utils.transfer_queue import critic_values_via_transfer_queue, initialize_transfer_queue
 
 
 def train(args):
@@ -80,7 +80,10 @@ def train(args):
         if args.use_critic:
             value_refs = critic_model.async_train(rollout_id, rollout_data_ref)
             if actor_trains_this_step:
-                ray.get(actor_model.async_train(rollout_id, rollout_data_ref, external_data=value_refs))
+                if critic_values_via_transfer_queue(args):
+                    ray.get(value_refs + actor_model.async_train(rollout_id, rollout_data_ref))
+                else:
+                    ray.get(actor_model.async_train(rollout_id, rollout_data_ref, external_data=value_refs))
             else:
                 ray.get(value_refs)
                 if args.use_transfer_queue:

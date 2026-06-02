@@ -4,6 +4,8 @@ import pytest
 
 from slime.utils.transfer_queue import (
     add_total_lengths,
+    actor_train_data_fields,
+    critic_values_via_transfer_queue,
     default_train_data_fields,
     dict_to_tensordict,
     normalize_train_data_for_transfer_queue,
@@ -20,6 +22,8 @@ def _args(**overrides):
         multimodal_keys=None,
         use_opd=False,
         opd_type=None,
+        use_critic=False,
+        use_transfer_queue=False,
         transfer_queue_extra_data_fields=[],
         actor_num_nodes=2,
         actor_num_gpus_per_node=8,
@@ -61,6 +65,30 @@ def test_default_train_data_fields_skips_absent_optional_fields():
     assert "rollout_routed_experts" not in fields
     assert "multimodal_train_inputs" not in fields
     assert "teacher_log_probs" not in fields
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize("flag", ["get_mismatch_metrics", "use_tis"])
+def test_default_train_data_fields_requests_rollout_log_probs_for_mismatch_modes(flag):
+    fields = default_train_data_fields(_args(**{flag: True}))
+
+    assert "rollout_log_probs" in fields
+
+
+@pytest.mark.unit
+def test_actor_train_data_fields_requests_values_when_critic_writeback_is_supported():
+    fields = actor_train_data_fields(_args(use_transfer_queue=True, use_critic=True, context_parallel_size=1))
+
+    assert critic_values_via_transfer_queue(_args(use_transfer_queue=True, use_critic=True, context_parallel_size=1))
+    assert "values" in fields
+
+
+@pytest.mark.unit
+def test_actor_train_data_fields_skips_values_when_context_parallel_needs_rank_local_values():
+    fields = actor_train_data_fields(_args(use_transfer_queue=True, use_critic=True, context_parallel_size=2))
+
+    assert not critic_values_via_transfer_queue(_args(use_transfer_queue=True, use_critic=True, context_parallel_size=2))
+    assert "values" not in fields
 
 
 @pytest.mark.unit
@@ -112,3 +140,21 @@ def test_dict_to_tensordict_converts_jagged_rollout_fields():
     assert td.batch_size.numel() == 2
     assert td["response_lengths"].tolist() == [2, 1]
     assert "tokens" in td.keys()
+
+
+@pytest.mark.unit
+def test_dict_to_tensordict_converts_tensor_list_fields_for_writeback():
+    torch = pytest.importorskip("torch")
+    pytest.importorskip("tensordict")
+
+    td = dict_to_tensordict(
+        {
+            "values": [
+                torch.tensor([0.1, 0.2]),
+                torch.tensor([0.3]),
+            ],
+        },
+        batch_size=2,
+    )
+
+    assert "values" in td.keys()

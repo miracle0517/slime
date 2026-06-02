@@ -16,6 +16,7 @@ logger = logging.getLogger(__name__)
 TRAIN_PARTITION_PREFIX = "train_"
 ACTOR_TRAIN_TASK = "actor_train"
 CRITIC_TRAIN_TASK = "critic_train"
+CRITIC_VALUE_FIELDS = ["values"]
 
 REQUIRED_TRAIN_DATA_FIELDS = [
     "tokens",
@@ -83,6 +84,12 @@ def initialize_transfer_queue(args: Namespace) -> None:
         args.num_data_storage_units,
         args.max_staleness,
     )
+    if getattr(args, "use_critic", False) and not critic_values_via_transfer_queue(args):
+        logger.warning(
+            "TransferQueue critic values write-back is disabled because context_parallel_size=%s; "
+            "critic values will use the existing Ray ObjectRef path.",
+            getattr(args, "context_parallel_size", 1),
+        )
 
 
 def transfer_queue_env_vars(args: Namespace) -> dict[str, str]:
@@ -208,6 +215,21 @@ def dict_to_tensordict(data: dict[str, list], batch_size: int | torch.Size | Non
             result[key] = value
             continue
 
+        if value and isinstance(value[0], torch.Tensor):
+            tensors = []
+            for item in value:
+                tensor = item.detach()
+                if tensor.device.type != "cpu":
+                    tensor = tensor.cpu()
+                if device is not None:
+                    tensor = tensor.to(device)
+                tensors.append(tensor)
+            if tensors[0].ndim == 0:
+                result[key] = torch.stack(tensors)
+            else:
+                result[key] = torch.nested.as_nested_tensor(tensors, layout=torch.jagged)
+            continue
+
         depth = nesting_depth(value)
         if depth == 0:
             result[key] = torch.empty(0, device=device)
@@ -234,6 +256,38 @@ def transfer_rollout_data(args: Namespace, client, rollout_id: int, train_data: 
         partition_id(rollout_id),
         len(train_data["tokens"]),
         sorted(train_data.keys()),
+    )
+
+
+def put_data_to_transfer_queue(
+    args: Namespace,
+    client,
+    rollout_id: int,
+    data: dict[str, Any],
+    *,
+    data_fields: list[str],
+    batch_meta=None,
+) -> None:
+    """Write derived fields back to an existing TransferQueue batch."""
+    if not transfer_queue_enabled(args) or client is None:
+        return
+
+    missing = [field for field in data_fields if field not in data]
+    if missing:
+        raise ValueError(f"TransferQueue write-back data is missing fields: {missing}")
+
+    payload = {field: data[field] for field in data_fields}
+    batch_size = len(next(iter(payload.values()))) if payload else 0
+    rollout_batch = dict_to_tensordict(payload, batch_size=batch_size)
+    if batch_meta is None:
+        raise ValueError("TransferQueue write-back requires batch_meta from the matching get_meta/get_data call.")
+
+    run(client.async_put(data=rollout_batch, metadata=batch_meta))
+    logger.info(
+        "Wrote TransferQueue fields: partition=%s fields=%s samples=%s",
+        partition_id(rollout_id),
+        data_fields,
+        batch_size,
     )
 
 
@@ -283,9 +337,14 @@ def default_train_data_fields(args: Namespace) -> list[str]:
         "raw_reward",
         "truncated",
         "sample_indices",
-        "rollout_log_probs"
     ]
-    
+
+    if (
+        getattr(args, "use_rollout_logprobs", False)
+        or getattr(args, "get_mismatch_metrics", False)
+        or getattr(args, "use_tis", False)
+    ):
+        fields.append("rollout_log_probs")
     if getattr(args, "use_rollout_routing_replay", False):
         fields.append("rollout_routed_experts")
     if getattr(args, "multimodal_keys", None) is not None:
@@ -295,6 +354,23 @@ def default_train_data_fields(args: Namespace) -> list[str]:
     for field in getattr(args, "transfer_queue_extra_data_fields", []) or []:
         if field not in fields:
             fields.append(field)
+    return fields
+
+
+def critic_values_via_transfer_queue(args: Namespace) -> bool:
+    return (
+        transfer_queue_enabled(args)
+        and getattr(args, "use_critic", False)
+        and int(getattr(args, "context_parallel_size", 1)) == 1
+    )
+
+
+def actor_train_data_fields(args: Namespace) -> list[str]:
+    fields = default_train_data_fields(args)
+    if critic_values_via_transfer_queue(args):
+        for field in CRITIC_VALUE_FIELDS:
+            if field not in fields:
+                fields.append(field)
     return fields
 
 
