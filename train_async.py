@@ -70,69 +70,6 @@ def _wait_all_transfer_queue_rollouts(pending_rollouts: dict[int, ray.ObjectRef]
     ray.get(list(pending_rollouts.values()))
 
 
-def _train_with_transfer_queue(
-    args,
-    rollout_manager,
-    actor_model,
-    critic_model,
-    num_rollout_per_epoch,
-) -> None:
-    pending_rollouts: dict[int, ray.ObjectRef] = {}
-    next_rollout_id = args.start_rollout_id
-    next_rollout_id = _fill_transfer_queue_rollout_window(args, rollout_manager, pending_rollouts, next_rollout_id)
-
-    for rollout_id in range(args.start_rollout_id, args.num_rollout):
-        rollout_write_ref = pending_rollouts.pop(rollout_id, None)
-        if rollout_write_ref is None:
-            rollout_write_ref = rollout_manager.generate.remote(rollout_id)
-
-        next_rollout_id = _fill_transfer_queue_rollout_window(args, rollout_manager, pending_rollouts, next_rollout_id)
-
-        if args.use_critic:
-            actor_trains_this_step = rollout_id >= args.num_critic_only_steps
-            value_refs = critic_model.async_train(rollout_id, None)
-            if actor_trains_this_step:
-                if critic_values_via_transfer_queue(args):
-                    train_refs = actor_model.async_train(rollout_id, None)
-                else:
-                    train_refs = actor_model.async_train(rollout_id, None, external_data=value_refs)
-                _wait_training_refs_with_rollout_write(rollout_id, value_refs + train_refs, rollout_write_ref)
-            else:
-                _wait_training_refs_with_rollout_write(rollout_id, value_refs, rollout_write_ref)
-                ray.get(rollout_manager.clear_transfer_queue_partition.remote(rollout_id))
-        else:
-            train_refs = actor_model.async_train(rollout_id, None)
-            _wait_training_refs_with_rollout_write(rollout_id, train_refs, rollout_write_ref)
-
-        if should_run_periodic_action(rollout_id, args.save_interval, num_rollout_per_epoch, args.num_rollout):
-            if (not args.use_critic) or rollout_id >= args.num_critic_only_steps:
-                actor_model.save_model(
-                    rollout_id,
-                    force_sync=rollout_id == args.num_rollout - 1,
-                )
-            if args.use_critic:
-                critic_model.save_model(
-                    rollout_id,
-                    force_sync=rollout_id == args.num_rollout - 1,
-                )
-            if args.rollout_global_dataset:
-                ray.get(rollout_manager.save.remote(rollout_id))
-
-        if (rollout_id + 1) % args.update_weights_interval == 0:
-            # Rollout engines must not receive weight updates in the middle of a generation call.
-            _wait_all_transfer_queue_rollouts(pending_rollouts)
-            actor_model.update_weights()
-            next_rollout_id = _fill_transfer_queue_rollout_window(
-                args,
-                rollout_manager,
-                pending_rollouts,
-                next_rollout_id,
-            )
-
-        if should_run_periodic_action(rollout_id, args.eval_interval, num_rollout_per_epoch):
-            ray.get(rollout_manager.eval.remote(rollout_id))
-
-
 # The framework supports other asynchronous approaches such as fully async (which is shown in examples/full_async).
 def train(args):
     assert not args.colocate, "Colocation is not supported for async training."
@@ -159,40 +96,74 @@ def train(args):
     if args.check_weight_update_equal:
         ray.get(rollout_manager.check_weights.remote(action="compare"))
 
-    if transfer_queue_enabled(args):
-        _train_with_transfer_queue(
+    use_transfer_queue = transfer_queue_enabled(args)
+    if use_transfer_queue:
+        pending_transfer_queue_rollouts: dict[int, ray.ObjectRef] = {}
+        next_transfer_queue_rollout_id = args.start_rollout_id
+        next_transfer_queue_rollout_id = _fill_transfer_queue_rollout_window(
             args,
             rollout_manager,
-            actor_model,
-            critic_model,
-            num_rollout_per_epoch,
+            pending_transfer_queue_rollouts,
+            next_transfer_queue_rollout_id,
         )
-        ray.get(rollout_manager.dispose.remote())
-        finish_tracking(args)
-        return
+        rollout_data_next_future = None
+    else:
+        pending_transfer_queue_rollouts = {}
+        rollout_data_next_future = rollout_manager.generate.remote(args.start_rollout_id)
 
     # async train loop.
-    rollout_data_next_future = rollout_manager.generate.remote(args.start_rollout_id)
     for rollout_id in range(args.start_rollout_id, args.num_rollout):
-        # Sync the last generation
-        if rollout_data_next_future is not None:
-            rollout_data_curr_ref = ray.get(rollout_data_next_future)
+        rollout_write_ref = None
+        if use_transfer_queue:
+            rollout_data_curr_ref = None
+            rollout_write_ref = pending_transfer_queue_rollouts.pop(rollout_id, None)
+            if rollout_write_ref is None:
+                rollout_write_ref = rollout_manager.generate.remote(rollout_id)
+            next_transfer_queue_rollout_id = _fill_transfer_queue_rollout_window(
+                args,
+                rollout_manager,
+                pending_transfer_queue_rollouts,
+                next_transfer_queue_rollout_id,
+            )
+        else:
+            # Sync the last generation
+            if rollout_data_next_future is not None:
+                rollout_data_curr_ref = ray.get(rollout_data_next_future)
 
-        # Start the next rollout early.
-        if rollout_id + 1 < args.num_rollout:
-            rollout_data_next_future = rollout_manager.generate.remote(rollout_id + 1)
+            # Start the next rollout early.
+            if rollout_id + 1 < args.num_rollout:
+                rollout_data_next_future = rollout_manager.generate.remote(rollout_id + 1)
 
         if args.use_critic:
             actor_trains_this_step = rollout_id >= args.num_critic_only_steps
             value_refs = critic_model.async_train(rollout_id, rollout_data_curr_ref)
             if actor_trains_this_step:
-                ray.get(actor_model.async_train(rollout_id, rollout_data_curr_ref, external_data=value_refs))
+                if critic_values_via_transfer_queue(args):
+                    train_refs = actor_model.async_train(rollout_id, rollout_data_curr_ref)
+                    _wait_training_refs_with_rollout_write(rollout_id, value_refs + train_refs, rollout_write_ref)
+                elif use_transfer_queue:
+                    train_refs = actor_model.async_train(
+                        rollout_id,
+                        rollout_data_curr_ref,
+                        external_data=value_refs,
+                    )
+                    _wait_training_refs_with_rollout_write(rollout_id, value_refs + train_refs, rollout_write_ref)
+                else:
+                    ray.get(actor_model.async_train(rollout_id, rollout_data_curr_ref, external_data=value_refs))
             else:
-                ray.get(value_refs)
-                if args.use_transfer_queue:
+                if use_transfer_queue:
+                    _wait_training_refs_with_rollout_write(rollout_id, value_refs, rollout_write_ref)
                     ray.get(rollout_manager.clear_transfer_queue_partition.remote(rollout_id))
+                else:
+                    ray.get(value_refs)
+                    if args.use_transfer_queue:
+                        ray.get(rollout_manager.clear_transfer_queue_partition.remote(rollout_id))
         else:
-            ray.get(actor_model.async_train(rollout_id, rollout_data_curr_ref))
+            train_refs = actor_model.async_train(rollout_id, rollout_data_curr_ref)
+            if use_transfer_queue:
+                _wait_training_refs_with_rollout_write(rollout_id, train_refs, rollout_write_ref)
+            else:
+                ray.get(train_refs)
 
         if should_run_periodic_action(rollout_id, args.save_interval, num_rollout_per_epoch, args.num_rollout):
             if (not args.use_critic) or rollout_id >= args.num_critic_only_steps:
@@ -209,10 +180,21 @@ def train(args):
                 ray.get(rollout_manager.save.remote(rollout_id))
 
         if (rollout_id + 1) % args.update_weights_interval == 0:
-            # sync generate before update weights to prevent update weight in the middle of generation
-            rollout_data_curr_ref = ray.get(x) if (x := rollout_data_next_future) is not None else None
-            rollout_data_next_future = None
+            if use_transfer_queue:
+                # Rollout engines must not receive weight updates in the middle of a generation call.
+                _wait_all_transfer_queue_rollouts(pending_transfer_queue_rollouts)
+            else:
+                # sync generate before update weights to prevent update weight in the middle of generation
+                rollout_data_curr_ref = ray.get(x) if (x := rollout_data_next_future) is not None else None
+                rollout_data_next_future = None
             actor_model.update_weights()
+            if use_transfer_queue:
+                next_transfer_queue_rollout_id = _fill_transfer_queue_rollout_window(
+                    args,
+                    rollout_manager,
+                    pending_transfer_queue_rollouts,
+                    next_transfer_queue_rollout_id,
+                )
 
         if should_run_periodic_action(rollout_id, args.eval_interval, num_rollout_per_epoch):
             ray.get(rollout_manager.eval.remote(rollout_id))
