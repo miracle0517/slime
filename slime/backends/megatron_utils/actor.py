@@ -25,11 +25,15 @@ from slime.utils.routing_replay import RoutingReplay
 from slime.utils.timer import Timer, inverse_timer, timer, with_defer
 from slime.utils.transfer_queue import (
     ACTOR_TRAIN_TASK,
+    CRITIC_VALUE_FIELDS,
     CRITIC_TRAIN_TASK,
+    actor_train_data_fields,
     clear_partition,
     connect_transfer_queue,
+    critic_values_via_transfer_queue,
     default_train_data_fields,
     get_data_from_transfer_queue,
+    put_data_to_transfer_queue,
     transfer_queue_enabled,
 )
 from slime.utils.types import RolloutBatch
@@ -271,8 +275,11 @@ class MegatronTrainRayActor(TrainRayActor):
 
     def _get_rollout_data_from_transfer_queue(self, rollout_id: int) -> RolloutBatch:
         task_name = CRITIC_TRAIN_TASK if self.role == "critic" else ACTOR_TRAIN_TASK
-        data_fields = default_train_data_fields(self.args)
+        data_fields = (
+            default_train_data_fields(self.args) if self.role == "critic" else actor_train_data_fields(self.args)
+        )
         rollout_data = None
+        batch_meta = None
         start_time = time.time()
         next_log_time = start_time + 10
         poll_interval = max(
@@ -280,7 +287,7 @@ class MegatronTrainRayActor(TrainRayActor):
             min(float(getattr(self.args, "transfer_queue_staleness_poll_interval", 1.0)), 1.0),
         )
         while rollout_data is None:
-            rollout_data, _batch_meta = get_data_from_transfer_queue(
+            rollout_data, batch_meta = get_data_from_transfer_queue(
                 self.args,
                 self.transfer_queue_client,
                 rollout_id,
@@ -301,6 +308,7 @@ class MegatronTrainRayActor(TrainRayActor):
                     )
                     next_log_time = now + 10
                 time.sleep(poll_interval)
+        self._transfer_queue_batch_meta = batch_meta
         return self._postprocess_transfer_queue_rollout_data(rollout_data)
 
     def _postprocess_transfer_queue_rollout_data(self, rollout_data: RolloutBatch) -> RolloutBatch:
@@ -336,7 +344,7 @@ class MegatronTrainRayActor(TrainRayActor):
             max_seq_len = (max_seq_len + pad_size - 1) // pad_size * pad_size
             rollout_data["max_seq_lens"] = [max_seq_len] * len(rollout_data["tokens"])
 
-        for key in ["rollout_log_probs", "teacher_log_probs"]:
+        for key in ["rollout_log_probs", "teacher_log_probs", "values"]:
             if key not in rollout_data:
                 continue
             rollout_data[key] = [
@@ -506,6 +514,21 @@ class MegatronTrainRayActor(TrainRayActor):
 
         # Compute current critic values (used as old_values for value loss and for actor advantages).
         rollout_data.update(forward_only(get_values, self.args, self.model, data_iterator, num_microbatches))
+        if (
+            critic_values_via_transfer_queue(self.args)
+            and mpu.is_pipeline_last_stage()
+            and mpu.get_tensor_model_parallel_rank() == 0
+            and mpu.get_context_parallel_rank() == 0
+            and "values" in rollout_data
+        ):
+            put_data_to_transfer_queue(
+                self.args,
+                self.transfer_queue_client,
+                rollout_id,
+                rollout_data,
+                data_fields=CRITIC_VALUE_FIELDS,
+                batch_meta=getattr(self, "_transfer_queue_batch_meta", None),
+            )
 
         compute_advantages_and_returns(self.args, rollout_data)
 
@@ -518,6 +541,9 @@ class MegatronTrainRayActor(TrainRayActor):
             data_iterator,
             num_microbatches,
         )
+
+        if critic_values_via_transfer_queue(self.args):
+            return {}
 
         if mpu.is_pipeline_last_stage() and "values" in rollout_data:
             from slime.backends.megatron_utils.data import tensors_to_cpu
